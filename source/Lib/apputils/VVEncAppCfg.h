@@ -603,6 +603,8 @@ int parse( int argc, char* argv[], vvenc_config* c, std::ostream& rcOstr )
   IStreamToEnum<int8_t>             toChromaLocInfo               ( &c->m_chromaLocInfoPresent,        &FlagToIntMap<int8_t> );
   IStreamToEnum<int8_t>             toMtProfile                   ( &c->m_mtProfile,                   &MtAbrevToIntMap );
   IStreamToInt8                     toNumParallelGOPs             ( &c->m_numParallelGOPs );
+  IStreamToInt8                     toAlfGpu                      ( &c->m_alfGpu );
+  IStreamToInt8                     toAlfProf                     ( &c->m_alfProf );
 
   po::Options opts;
   if( m_easyMode )
@@ -1106,6 +1108,8 @@ int parse( int argc, char* argv[], vvenc_config* c, std::ostream& rcOstr )
     ("MaxNumAlfAlternativesChroma",                     c->m_maxNumAlfAlternativesChroma,                    std::string("Maximum number of alternative Chroma filters (1-") + std::to_string(VVENC_MAX_NUM_ALF_ALTERNATIVES_CHROMA) + std::string (", inclusive)") )
     ("ALFTempPred",                                     c->m_alfTempPred,                                    "Enable usage of ALF temporal prediction for filter data\n" )
     ("ALFUnitSize",                                     c->m_alfUnitSize,                                    "Size of ALF Search Unit [-1:default size(CTU)]\n" )
+    ("AlfGpu",                                          toAlfGpu,                                            "ALF luma reconstruction on the GPU (0: off, 1: GPU classification+filter, 2: GPU filter with CPU classification, 3: verify GPU vs CPU)" )
+    ("AlfProf",                                         toAlfProf,                                           "ALF time/energy profiling report (0: off, 1: on)" )
     ("PROF",                                            c->m_PROF,                                           "Enable prediction refinement with optical flow for affine mode")
     ("Affine",                                          c->m_Affine,                                         "Enable affine prediction")
     ("AffineType",                                      c->m_AffineType,                                     "Enable affine type prediction")

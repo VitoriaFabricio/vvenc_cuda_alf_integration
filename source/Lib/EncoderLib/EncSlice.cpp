@@ -46,6 +46,7 @@ POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include "EncSlice.h"
+#include "AlfProfiler.h"
 #include "EncStage.h"
 #include "EncLib.h"
 #include "EncPicture.h"
@@ -1149,6 +1150,7 @@ bool EncSlice::xProcessCtuTask( int threadIdx, void* taskParam )
         if( slice.sps->alfEnabled )
         {
           PROFILER_EXT_ACCUM_AND_START_NEW_SET( 1, _TPROF, P_ALF, &cs, CH_L );
+          AlfProfScope alfProfScope( ALFP_STATS );
           PelUnitBuf recoBuf = cs.picture->getRecoBuf();
           const int firstCtuInRow = ctuRsAddr + 1 - slice.pps->tileColWidth[slice.pps->ctuToTileCol[ctuPosX]];
           for( int ctu = firstCtuInRow; ctu <= ctuRsAddr; ctu++ )
@@ -1197,11 +1199,17 @@ bool EncSlice::xProcessCtuTask( int threadIdx, void* taskParam )
         if( slice.sps->alfEnabled )
         {
           PROFILER_EXT_ACCUM_AND_START_NEW_SET( 1, _TPROF, P_ALF, &cs, CH_L );
+          AlfProfScope alfProfScope( ALFP_DERIVE );
           if( ctuRsAddr == deriveFilterCtu )
           {
             encSlice->m_pALF->initDerivation( slice );
             encSlice->m_pALF->deriveFilter( *cs.picture, cs, slice.getLambdas(), deriveFilterCtu + 1 );
             encSlice->m_pALF->reconstructCoeffAPSs( cs, cs.slice->alfEnabled[COMP_Y], cs.slice->alfEnabled[COMP_Cb] || cs.slice->alfEnabled[COMP_Cr], false );
+            if( deriveFilterCtu + 1 == pcv.sizeInCtus )
+            {
+              // whole-picture decisions are final here (not in IFP line-sync mode): optional dump for the standalone benchmark
+              encSlice->m_pALF->dumpFrameForBench( cs );
+            }
           }
           else if( syncLines )
           {
@@ -1244,11 +1252,10 @@ bool EncSlice::xProcessCtuTask( int threadIdx, void* taskParam )
         if( slice.sps->alfEnabled )
         {
           PROFILER_EXT_ACCUM_AND_START_NEW_SET( 1, _TPROF, P_ALF, &cs, CH_L );
+          AlfProfScope alfProfScope( ALFP_RECON );
           const int firstCtuInRow = ctuRsAddr + 1 - slice.pps->tileColWidth[slice.pps->ctuToTileCol[ctuPosX]];
-          for( int ctu = firstCtuInRow; ctu <= ctuRsAddr; ctu++ )
-          {
-            encSlice->m_pALF->reconstructCTU_MT( *cs.picture, cs, ctu, encSlice->m_ThreadRsrc[ threadIdx ]->m_alfTempCtuBuf );
-          }
+          // CPU (VVenC) or GPU backend, selected with --AlfGpu
+          encSlice->m_pALF->reconstructCtuRow( *cs.picture, cs, firstCtuInRow, ctuRsAddr, encSlice->m_ThreadRsrc[ threadIdx ]->m_alfTempCtuBuf, threadIdx );
           PROFILER_EXT_ACCUM_AND_START_NEW_SET( 1, _TPROF, P_IGNORE, &cs, CH_L );
         }
 
@@ -1272,6 +1279,7 @@ bool EncSlice::xProcessCtuTask( int threadIdx, void* taskParam )
         if( slice.sps->ccalfEnabled )
         {
           PROFILER_EXT_ACCUM_AND_START_NEW_SET( 1, _TPROF, P_ALF, &cs, CH_L);
+          AlfProfScope alfProfScope( ALFP_CCALF_STATS );
           const int firstCtuInRow = ctuRsAddr + 1 - slice.pps->tileColWidth[slice.pps->ctuToTileCol[ctuPosX]];
           for( int ctu = firstCtuInRow; ctu <= ctuRsAddr; ctu++ )
           {
@@ -1320,6 +1328,7 @@ bool EncSlice::xProcessCtuTask( int threadIdx, void* taskParam )
         // start task
         if( slice.sps->ccalfEnabled )
         {
+          AlfProfScope alfProfScope( ALFP_CCALF_DERIVE );
           if( ctuRsAddr == deriveFilterCtu )
           {
             encSlice->m_pALF->deriveCcAlfFilter( *cs.picture, cs, encSlice->m_ccalfDeriveCtu + 1 );
@@ -1362,6 +1371,7 @@ bool EncSlice::xProcessCtuTask( int threadIdx, void* taskParam )
 
         if( slice.sps->ccalfEnabled )
         {
+          AlfProfScope alfProfScope( ALFP_CCALF_RECON );
           const int firstCtuInRow = ctuRsAddr + 1 - slice.pps->tileColWidth[slice.pps->ctuToTileCol[ctuPosX]];
           for( int ctu = firstCtuInRow; ctu <= ctuRsAddr; ctu++ )
           {

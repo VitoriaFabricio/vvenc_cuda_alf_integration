@@ -55,6 +55,11 @@ POSSIBILITY OF SUCH DAMAGE.
 
 #include "vvenc/vvencCfg.h"
 #include "Utilities/NoMallocThreadPool.h"
+#include "AlfProfiler.h"
+
+#include <atomic>
+#include <cstdlib>
+#include <cstdio>
 
 #if defined( TARGET_SIMD_X86 )
 #  include "CommonDefX86.h"
@@ -1094,6 +1099,8 @@ EncAdaptiveLoopFilter::EncAdaptiveLoopFilter( bool enableOpt )
   {
     m_alfFilterStatEnabled[i] = false;
   }
+  m_alfGpuMode = alfgpu::MODE_OFF;
+  m_alfGpu     = nullptr;
 
   m_getPreBlkStatsAccum = getPreBlkStatsAccum;
   m_getPreBlkStatsWeightedAccum = getPreBlkStatsWeightedAccum;
@@ -1140,6 +1147,24 @@ void EncAdaptiveLoopFilter::init( const VVEncCfg& encCfg, const PPS& pps, CABACW
   m_CtxCache = &ctxCache;
 
   initASU( m_encCfg->m_alfUnitSize );
+
+  // ALF GPU offload (--AlfGpu, or env VVENC_ALF_GPU for applications without the option)
+  m_alfGpuMode = encCfg.m_alfGpu;
+  if( !m_alfGpuMode )
+  {
+    if( const char* s = getenv( "VVENC_ALF_GPU" ) ) m_alfGpuMode = std::max( 0, std::min( 3, atoi( s ) ) );
+  }
+  if( m_alfGpuMode && encCfg.m_alf )
+  {
+    std::vector<int16_t> fixedClip( NUM_FIXED_FILTER_SETS * MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF );
+    for( int s = 0; s < NUM_FIXED_FILTER_SETS; s++ )
+    {
+      std::memcpy( &fixedClip[s * MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF], m_clipDefault, sizeof( m_clipDefault ) );
+    }
+    static_assert( alfgpu::kSetStride == MAX_NUM_ALF_CLASSES * MAX_NUM_ALF_LUMA_COEFF, "set layout mismatch" );
+    m_alfGpu = AlfProfiler::get().backend( &m_fixedFilterSetCoeffDec[0][0], fixedClip.data(), m_picWidth, m_maxCUHeight,
+                                           std::max( 1, encCfg.m_numThreads ) + 1 );
+  }
 
   const int numBins = m_encCfg->m_useNonLinearAlfLuma || m_encCfg->m_useNonLinearAlfChroma ? MaxAlfNumClippingValues : 1;
 
@@ -1860,7 +1885,7 @@ void EncAdaptiveLoopFilter::deriveFilter( Picture& pic, CodingStructure& cs, con
   }
 }
 
-void EncAdaptiveLoopFilter::reconstructCTU_MT( Picture& pic, CodingStructure& cs, const int ctuRsAddr, PelStorage& alfTempCtuBuf )
+void EncAdaptiveLoopFilter::reconstructCTU_MT( Picture& pic, CodingStructure& cs, const int ctuRsAddr, PelStorage& alfTempCtuBuf, const bool skipLuma )
 {
   PROFILER_SCOPE_AND_STAGE( 0, _TPROF, P_ALF_REC );
 
@@ -1878,7 +1903,226 @@ void EncAdaptiveLoopFilter::reconstructCTU_MT( Picture& pic, CodingStructure& cs
 
   // Perform filtering
   PelUnitBuf ctuBuf = m_tempBuf.getBuf( ctuArea );
-  reconstructCTU( pic, cs, ctuBuf, ctuRsAddr, alfTempCtuBuf );
+  reconstructCTU( pic, cs, ctuBuf, ctuRsAddr, alfTempCtuBuf, skipLuma );
+}
+
+// ====================================================================================================================
+// GPU offload of the luma ALF reconstruction (one CTU row per call)
+// ====================================================================================================================
+
+// Only CTUs that VVenC filters directly on the picture buffer (not crossed by virtual / slice / tile
+// boundaries that require extra padding) are sent to the backend; the others keep the full VVenC path.
+
+void EncAdaptiveLoopFilter::reconstructCtuRow( Picture& pic, CodingStructure& cs, const int firstCtu, const int lastCtu, PelStorage& alfTempCtuBuf, const int threadIdx )
+{
+  if( !m_alfGpuMode || !m_alfGpu || isSkipAlfForFrame( pic ) )
+  {
+    for( int ctu = firstCtu; ctu <= lastCtu; ctu++ )
+    {
+      reconstructCTU_MT( pic, cs, ctu, alfTempCtuBuf );
+    }
+    return;
+  }
+
+  const PreCalcValues& pcv = *cs.pcv;
+  const int  ctuSize  = pcv.maxCUSize;
+  const int  numCols  = pcv.widthInCtus;
+  const int  ctuY     = firstCtu / numCols;
+  const int  bandY0   = ctuY << pcv.maxCUSizeLog2;
+  const int  bandH    = std::min<int>( ctuSize, pcv.lumaHeight - bandY0 );
+  const int  picW     = pcv.lumaWidth;
+  const bool verify   = m_alfGpuMode == alfgpu::MODE_VERIFY;
+  const int  numClassBlocksInCTU = ( MAX_CU_SIZE * MAX_CU_SIZE ) >> 4;
+  CHECK( lastCtu / numCols != ctuY, "ALF GPU: CTU range must be inside one CTU row" );
+  CHECK( picW != m_picWidth, "ALF GPU: unexpected picture width" );
+  CHECK( cs.slice->clpRngs.bd != m_inputBitDepth[CH_L], "ALF GPU: bit depth mismatch" );
+
+  const short* alfCtuFilterIndex = cs.picture->m_alfCtbFilterIndex.data();
+  std::vector<int16_t> setIdx( numCols, -1 );
+  int maxSet = -1, numGpu = 0;
+
+  for( int ctu = firstCtu; ctu <= lastCtu; ctu++ )
+  {
+    if( !m_ctuEnableFlag[COMP_Y][ctu] ) continue;
+    const int xPos   = ( ctu % numCols ) << pcv.maxCUSizeLog2;
+    const int width  = std::min<int>( ctuSize, pcv.lumaWidth - xPos );
+    bool clipTop, clipBottom, clipLeft, clipRight;
+    int numHorVirBndry, numVerVirBndry, horVirBndryPos[3], verVirBndryPos[3], rasterSliceAlfPad;
+    if( isCrossedByVirtualBoundaries( cs, xPos, bandY0, width, bandH, clipTop, clipBottom, clipLeft, clipRight,
+                                      numHorVirBndry, numVerVirBndry, horVirBndryPos, verVirBndryPos, rasterSliceAlfPad ) )
+    {
+      continue;   // keeps the VVenC path (padding at slice/tile/virtual boundaries)
+    }
+    setIdx[ctu % numCols] = alfCtuFilterIndex[ctu];
+    maxSet = std::max<int>( maxSet, alfCtuFilterIndex[ctu] );
+    numGpu++;
+  }
+
+  const int clsStride = picW >> 2;
+  const int clsRows   = ( bandH + 3 ) >> 2;
+  std::vector<uint8_t> clsCpu, clsGpu;
+  std::vector<Pel>     gpuOut;
+  PelBuf recY = cs.getRecoBufRef().get( COMP_Y );
+
+  if( numGpu )
+  {
+    const CPelBuf tmpY = m_tempBuf.get( COMP_Y );
+
+    if( m_alfGpuMode == alfgpu::MODE_FILTER || verify )
+    {
+      // VVenC classification (computed during ALF_GET_STATISTICS) packed as (classIdx | transposeIdx << 5)
+      clsCpu.assign( ( size_t ) clsStride * clsRows, 0 );
+      for( int col = 0; col < numCols; col++ )
+      {
+        if( setIdx[col] < 0 ) continue;
+        const int ctu = ctuY * numCols + col;
+        const int x0  = col * ctuSize, w = std::min( ctuSize, picW - x0 );
+        const AlfClassifier* cl = &m_classifier[numClassBlocksInCTU * ctu];
+        for( int by = 0; by < bandH; by += 4 )
+          for( int bx = 0; bx < w; bx += 4 )
+          {
+            const AlfClassifier& c = cl[( by >> 2 ) * ( MAX_CU_SIZE >> 2 ) + ( bx >> 2 )];
+            clsCpu[( by >> 2 ) * clsStride + ( ( x0 + bx ) >> 2 )] = ( uint8_t ) ( c.classIdx | ( c.transposeIdx << 5 ) );
+          }
+      }
+    }
+
+    alfgpu::BandParams bp;
+    bp.src        = tmpY.bufAt( 0, bandY0 );
+    bp.srcStride  = tmpY.stride;
+    bp.picWidth   = picW;
+    bp.bandY0     = bandY0;
+    bp.bandH      = bandH;
+    bp.ctuSize    = ctuSize;
+    bp.numCtuCols = numCols;
+    bp.bitDepth   = m_inputBitDepth[CH_L];
+    bp.vbH        = m_alfVBLumaCTUHeight;
+    bp.vbPos      = m_alfVBLumaPos;
+    bp.ctuSetIdx  = setIdx.data();
+    bp.numAps     = std::max( 0, maxSet - NUM_FIXED_FILTER_SETS + 1 );
+    bp.apsCoef    = &m_coeffApsLuma[0][0];
+    bp.apsClip    = &m_clippApsLuma[0][0];
+    bp.cpuClass   = m_alfGpuMode == alfgpu::MODE_FILTER ? clsCpu.data() : nullptr;
+    if( verify )
+    {
+      gpuOut.assign( ( size_t ) picW * bandH, 0 );
+      clsGpu.assign( ( size_t ) clsStride * clsRows, 0 );
+      bp.dst       = gpuOut.data();
+      bp.dstStride = picW;
+      bp.outClass  = clsGpu.data();
+    }
+    else
+    {
+      bp.dst       = recY.bufAt( 0, bandY0 );
+      bp.dstStride = recY.stride;
+      bp.outClass  = nullptr;
+    }
+
+    alfgpu::Timing t;
+    {
+      AlfProfScope profScope( ALFP_RECON_LUMA_GPU );
+      m_alfGpu->filterLumaBand( bp, verify ? alfgpu::MODE_FULL : m_alfGpuMode, threadIdx, t );
+    }
+    if( AlfProfiler::get().enabled() ) AlfProfiler::get().addGpu( t );
+  }
+
+  // remaining work on the CPU: chroma, luma of CTUs not handled by the backend (and everything in verify mode)
+  for( int ctu = firstCtu; ctu <= lastCtu; ctu++ )
+  {
+    const bool lumaDoneOnGpu = !verify && setIdx[ctu % numCols] >= 0;
+    reconstructCTU_MT( pic, cs, ctu, alfTempCtuBuf, lumaDoneOnGpu );
+  }
+
+  if( verify && numGpu )
+  {
+    uint64_t samples = 0, sampleErr = 0, blocks = 0, blockErr = 0;
+    for( int col = 0; col < numCols; col++ )
+    {
+      if( setIdx[col] < 0 ) continue;
+      const int x0 = col * ctuSize, w = std::min( ctuSize, picW - x0 );
+      for( int y = 0; y < bandH; y++ )
+        for( int x = x0; x < x0 + w; x++ )
+        {
+          samples++;
+          const Pel g = gpuOut[( size_t ) y * picW + x], r = recY.at( x, bandY0 + y );
+          if( g != r && sampleErr++ < 5 )
+            fprintf( stderr, "[AlfGpu] VERIFY sample mismatch POC %d (%d,%d): gpu=%d vvenc=%d\n", cs.slice->poc, x, bandY0 + y, g, r );
+        }
+      for( int by = 0; by < bandH; by += 4 )
+        for( int bx = x0; bx < x0 + w; bx += 4 )
+        {
+          blocks++;
+          const uint8_t g = clsGpu[( by >> 2 ) * clsStride + ( bx >> 2 )], r = clsCpu[( by >> 2 ) * clsStride + ( bx >> 2 )];
+          if( g != r && blockErr++ < 5 )
+            fprintf( stderr, "[AlfGpu] VERIFY class mismatch POC %d (%d,%d): gpu=(%d,%d) vvenc=(%d,%d)\n", cs.slice->poc, bx, bandY0 + by, g & 31, g >> 5, r & 31, r >> 5 );
+        }
+    }
+    AlfProfiler::get().addVerify( samples, sampleErr, blocks, blockErr );
+  }
+}
+
+void EncAdaptiveLoopFilter::dumpFrameForBench( CodingStructure& cs )
+{
+  const char* dir = getenv( "VVENC_ALF_DUMP" );
+  if( !dir || isSkipAlfForFrame( *cs.picture ) ) return;
+  static std::atomic<int> numDumped( 0 );
+  int maxDump = 8;
+  if( const char* s = getenv( "VVENC_ALF_DUMP_MAX" ) ) maxDump = atoi( s );
+  if( numDumped.fetch_add( 1 ) >= maxDump ) return;
+
+  const PreCalcValues& pcv = *cs.pcv;
+  const int W = pcv.lumaWidth, H = pcv.lumaHeight, halo = alfgpu::kHalo;
+  const int numCols = pcv.widthInCtus, numRows = pcv.heightInCtus;
+  const int numClassBlocksInCTU = ( MAX_CU_SIZE * MAX_CU_SIZE ) >> 4;
+  const short* alfCtuFilterIndex = cs.picture->m_alfCtbFilterIndex.data();
+
+  std::vector<int16_t> setIdx( numCols * numRows, -1 );
+  int maxSet = -1;
+  for( int ctu = 0; ctu < numCols * numRows; ctu++ )
+  {
+    if( !cs.slice->alfEnabled[COMP_Y] || !m_ctuEnableFlag[COMP_Y][ctu] ) continue;
+    const int xPos = ( ctu % numCols ) << pcv.maxCUSizeLog2, yPos = ( ctu / numCols ) << pcv.maxCUSizeLog2;
+    const int w = std::min<int>( pcv.maxCUSize, W - xPos ), h = std::min<int>( pcv.maxCUSize, H - yPos );
+    bool cT, cB, cL, cR; int nH, nV, hP[3], vP[3], rP;
+    if( isCrossedByVirtualBoundaries( cs, xPos, yPos, w, h, cT, cB, cL, cR, nH, nV, hP, vP, rP ) ) continue;
+    setIdx[ctu] = alfCtuFilterIndex[ctu];
+    maxSet = std::max<int>( maxSet, alfCtuFilterIndex[ctu] );
+  }
+  const int numAps = std::max( 0, maxSet - NUM_FIXED_FILTER_SETS + 1 );
+
+  char name[1024];
+  snprintf( name, sizeof( name ), "%s/alf_poc%05d.bin", dir, cs.slice->poc );
+  FILE* f = fopen( name, "wb" );
+  if( !f ) { fprintf( stderr, "[AlfGpu] cannot write %s\n", name ); return; }
+
+  const int32_t hdr[12] = { 1, W, H, ( int32_t ) pcv.maxCUSize, m_inputBitDepth[CH_L], m_alfVBLumaCTUHeight, m_alfVBLumaPos,
+                            numCols, numRows, halo, cs.slice->poc, numAps };
+  fwrite( "ALFD", 1, 4, f );
+  fwrite( hdr, sizeof( hdr ), 1, f );
+  const CPelBuf tmpY = m_tempBuf.get( COMP_Y );
+  for( int y = -halo; y < H + halo; y++ ) fwrite( tmpY.bufAt( -halo, y ), sizeof( Pel ), W + 2 * halo, f );
+  fwrite( setIdx.data(), sizeof( int16_t ), setIdx.size(), f );
+  fwrite( &m_coeffApsLuma[0][0], sizeof( short ), numAps * alfgpu::kSetStride, f );
+  fwrite( &m_clippApsLuma[0][0], sizeof( short ), numAps * alfgpu::kSetStride, f );
+  fwrite( &m_fixedFilterSetCoeffDec[0][0], sizeof( short ), NUM_FIXED_FILTER_SETS * alfgpu::kSetStride, f );
+  for( int s = 0; s < NUM_FIXED_FILTER_SETS; s++ ) fwrite( m_clipDefault, sizeof( short ), alfgpu::kSetStride, f );
+  // VVenC classification (255 = not filtered) to cross-check the benchmark's classification
+  std::vector<uint8_t> cls( ( size_t ) ( W >> 2 ) * ( ( H + 3 ) >> 2 ), 255 );
+  for( int ctu = 0; ctu < numCols * numRows; ctu++ )
+  {
+    if( setIdx[ctu] < 0 ) continue;
+    const int x0 = ( ctu % numCols ) * pcv.maxCUSize, y0 = ( ctu / numCols ) * pcv.maxCUSize;
+    const int w = std::min<int>( pcv.maxCUSize, W - x0 ), h = std::min<int>( pcv.maxCUSize, H - y0 );
+    const AlfClassifier* cl = &m_classifier[numClassBlocksInCTU * ctu];
+    for( int by = 0; by < h; by += 4 )
+      for( int bx = 0; bx < w; bx += 4 )
+      {
+        const AlfClassifier& c = cl[( by >> 2 ) * ( MAX_CU_SIZE >> 2 ) + ( bx >> 2 )];
+        cls[( ( y0 + by ) >> 2 ) * ( W >> 2 ) + ( ( x0 + bx ) >> 2 )] = ( uint8_t ) ( c.classIdx | ( c.transposeIdx << 5 ) );
+      }
+  }
+  fwrite( cls.data(), 1, cls.size(), f );
+  fclose( f );
 }
 
 #if ENABLE_TRACING
@@ -1899,7 +2143,7 @@ void traceStreamBlock( std::stringstream& str, Tsrc *buf, unsigned stride, unsig
 }
 #endif
 
-void EncAdaptiveLoopFilter::reconstructCTU( Picture& pic, CodingStructure& cs, const CPelUnitBuf& recExtBufCTU, const int ctuRsAddr, PelStorage& alfTempCtuBuf )
+void EncAdaptiveLoopFilter::reconstructCTU( Picture& pic, CodingStructure& cs, const CPelUnitBuf& recExtBufCTU, const int ctuRsAddr, PelStorage& alfTempCtuBuf, const bool skipLuma )
 {
   bool ctuEnableFlag = m_ctuEnableFlag[COMP_Y][ctuRsAddr];
   const int numberOfComponents = getNumberValidComponents( m_chromaFormat );
@@ -1987,8 +2231,9 @@ void EncAdaptiveLoopFilter::reconstructCTU( Picture& pic, CodingStructure& cs, c
           dstBuf.extendBorderPel( MAX_ALF_PADDING_SIZE );
           PelUnitBuf buf = dstBuf.subBuf( UnitArea( cs.area.chromaFormat, Area( clipL ? 0 : MAX_ALF_PADDING_SIZE, clipT ? 0 : MAX_ALF_PADDING_SIZE, w, h ) ) );
 
-          if( m_ctuEnableFlag[COMP_Y][ctuRsAddr] )
+          if( m_ctuEnableFlag[COMP_Y][ctuRsAddr] && !skipLuma )
           {
+            AlfProfScope profScope( ALFP_RECON_LUMA_CPU );
             const Area blkSrc( 0, 0, w, h );
             const Area blkDst( xStart, yStart, w, h );
             short filterSetIndex = alfCtuFilterIndex[ctuRsAddr];
@@ -2030,8 +2275,9 @@ void EncAdaptiveLoopFilter::reconstructCTU( Picture& pic, CodingStructure& cs, c
     else
     {
       const UnitArea area( cs.area.chromaFormat, Area( xPos, yPos, width, height ) );
-      if( m_ctuEnableFlag[COMP_Y][ctuRsAddr] )
+      if( m_ctuEnableFlag[COMP_Y][ctuRsAddr] && !skipLuma )
       {
+        AlfProfScope profScope( ALFP_RECON_LUMA_CPU );
         const Area blk( xPos, yPos, width, height );
         const Area blkSrc( 0, 0, width, height );
         short filterSetIndex = alfCtuFilterIndex[ctuRsAddr];

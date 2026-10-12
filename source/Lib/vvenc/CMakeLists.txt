@@ -211,6 +211,36 @@ if( CMAKE_USE_PTHREADS_INIT )
   target_compile_definitions( ${LIB_NAME} PRIVATE HAVE_PTHREADS )
 endif()
 
+# ---------------------------------------------------------------------------------------------------------------------
+# optional CUDA backend for the ALF luma reconstruction (--AlfGpu). Without it, --AlfGpu runs the host emulation backend.
+#   cmake -DVVENC_ENABLE_CUDA_ALF=ON [-DCMAKE_CUDA_ARCHITECTURES=native|86|...] ...
+# ---------------------------------------------------------------------------------------------------------------------
+option( VVENC_ENABLE_CUDA_ALF "Build the CUDA backend of the ALF luma reconstruction (--AlfGpu)" OFF )
+if( VVENC_ENABLE_CUDA_ALF )
+  if( NOT DEFINED CMAKE_CUDA_ARCHITECTURES )
+    set( CMAKE_CUDA_ARCHITECTURES 75 80 86 89 )
+  endif()
+  enable_language( CUDA )
+  find_package( CUDAToolkit REQUIRED )
+
+  add_library( ${LIB_NAME}_cuda_alf OBJECT ../CommonLib/cuda/AlfGpuCuda.cu ../CommonLib/cuda/AlfGpuKernels.cuh )
+  set_target_properties( ${LIB_NAME}_cuda_alf PROPERTIES
+                         CUDA_STANDARD 14
+                         CUDA_STANDARD_REQUIRED ON
+                         POSITION_INDEPENDENT_CODE ON
+                         INTERPROCEDURAL_OPTIMIZATION OFF
+                         FOLDER lib )
+  # the project-wide host warning flags (-Werror -Wall ...) are not nvcc options: replace them for this target
+  set_property( TARGET ${LIB_NAME}_cuda_alf PROPERTY COMPILE_OPTIONS "" )
+  target_compile_options( ${LIB_NAME}_cuda_alf PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3 -lineinfo -Xcompiler=-Wall> )
+  target_link_libraries( ${LIB_NAME}_cuda_alf PRIVATE CUDA::cudart_static CUDA::nvml )
+
+  target_sources( ${LIB_NAME} PRIVATE $<TARGET_OBJECTS:${LIB_NAME}_cuda_alf> )
+  target_compile_definitions( ${LIB_NAME} PRIVATE VVENC_CUDA_ALF=1 )
+  target_link_libraries( ${LIB_NAME} PRIVATE CUDA::cudart_static CUDA::nvml )
+  message( STATUS "ALF CUDA backend enabled (architectures: ${CMAKE_CUDA_ARCHITECTURES})" )
+endif()
+
 # set the folder where to place the projects
 set_target_properties( ${LIB_NAME} PROPERTIES
                                    VERSION ${PROJECT_VERSION}

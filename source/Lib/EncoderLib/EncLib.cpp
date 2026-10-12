@@ -46,6 +46,7 @@ POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include "EncLib.h"
+#include "AlfProfiler.h"
 #include "CommonLib/Picture.h"
 #include "CommonLib/CommonDef.h"
 #include "CommonLib/TimeProfiler.h"
@@ -142,10 +143,19 @@ void EncLib::initEncoderLib( const vvenc_config& encCfg )
   }
   g_timeProfiler = timeProfilerCreate( encCfg );
 #endif
+  // ALF time/energy profiling (--AlfProf=1 or env VVENC_ALF_PROF=1); started last so that init time is excluded
+  {
+    const char* envProf = getenv( "VVENC_ALF_PROF" );
+    int gpuMode = m_encCfg.m_alfGpu;
+    if( !gpuMode && getenv( "VVENC_ALF_GPU" ) ) gpuMode = atoi( getenv( "VVENC_ALF_GPU" ) );
+    AlfProfiler::get().start( m_encCfg.m_alfProf || ( envProf && atoi( envProf ) ), gpuMode );
+  }
 }
 
 void EncLib::uninitEncoderLib()
 {
+  AlfProfiler::get().stop();
+
 #if ENABLE_TRACING
   if( g_trace_ctx )
   {

@@ -48,6 +48,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "vvenc/vvencCfg.h"
 #include "CABACWriter.h"
 #include "CommonLib/AdaptiveLoopFilter.h"
+#include "CommonLib/AlfGpu.h"
 
 //! \ingroup EncoderLib
 //! \{
@@ -404,6 +405,8 @@ private:
   int                    m_numCtusInAsuHeight;
   bool                   m_accumStatCTUWise;
   bool                   m_alfFilterStatEnabled[MAX_NUM_COMP];
+  int                    m_alfGpuMode;
+  alfgpu::Backend*       m_alfGpu;
 
 public:
   EncAdaptiveLoopFilter( bool enableOpt = true );
@@ -426,8 +429,13 @@ public:
   void applyCcAlfFilterCTU          ( CodingStructure& cs, ComponentID compID, const int ctuRsAddr, PelStorage& alfTempCtuBuf );
   void deriveFilter                 ( Picture& pic, CodingStructure& cs, const double* lambdas, const int numCtus );
   void selectFilterForCTU           ( CodingStructure& cs, CABACWriter* CABACEstimator, CtxCache* ctxCache, int ctuIdx );
-  void reconstructCTU_MT            ( Picture& pic, CodingStructure& cs, const int ctuRsAddr, PelStorage& alfTempCtuBuf );
-  void reconstructCTU               ( Picture& pic, CodingStructure& cs, const CPelUnitBuf& recBuf, const int ctuRsAddr, PelStorage& alfTempCtuBuf );
+  void reconstructCTU_MT            ( Picture& pic, CodingStructure& cs, const int ctuRsAddr, PelStorage& alfTempCtuBuf, const bool skipLuma = false );
+  void reconstructCTU               ( Picture& pic, CodingStructure& cs, const CPelUnitBuf& recBuf, const int ctuRsAddr, PelStorage& alfTempCtuBuf, const bool skipLuma = false );
+  // ALF_RECONSTRUCT stage for CTUs [firstCtu, lastCtu] of one CTU row: CPU (VVenC) or GPU backend depending on --AlfGpu
+  void reconstructCtuRow            ( Picture& pic, CodingStructure& cs, const int firstCtu, const int lastCtu, PelStorage& alfTempCtuBuf, const int threadIdx );
+  // writes the pre-ALF luma + CTU decisions + filter sets of the picture for the standalone benchmark (env VVENC_ALF_DUMP=dir)
+  void dumpFrameForBench            ( CodingStructure& cs );
+  int  getAlfGpuMode                () const { return m_alfGpuMode; }
 //  void alfReconstructor             ( CodingStructure& cs );
   void initEncProcess               ( Slice& slice );
   void initDerivation               ( Slice& slice );

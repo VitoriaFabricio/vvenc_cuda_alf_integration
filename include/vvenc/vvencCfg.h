@@ -788,7 +788,9 @@ typedef struct vvenc_config
   int8_t              m_numParallelGOPs;
   int8_t              m_maxDeltaQP;
 
-  int8_t              m_reservedInt8[2];
+  int8_t              m_alfGpu;                                                          // ALF luma reconstruction offload (uses the 2 former reserved int8 slots, ABI unchanged):
+                                                                                         // 0: off (VVenC CPU), 1: GPU classification+filter, 2: GPU filter with VVenC classification, 3: verify GPU vs CPU
+  int8_t              m_alfProf;                                                         // ALF time / energy profiling report (0: off, 1: on)
   double              m_reservedDouble[8];
 
   // internal state variables

@@ -695,7 +695,8 @@ VVENC_DECL void vvenc_config_default(vvenc_config *c )
 
   c->m_fga                                     = false;
 
-  memset( c->m_reservedInt8, 0, sizeof(c->m_reservedInt8) );
+  c->m_alfGpu  = 0;
+  c->m_alfProf = 0;
   memset( c->m_reservedDouble, 0, sizeof(c->m_reservedDouble) );
 
   // init default preset
@@ -2155,6 +2156,7 @@ static bool checkCfgParameter( vvenc_config *c )
   vvenc_confirmParameter(c, c->m_alfUnitSize % c->m_CTUSize != 0,                                 "ALF Unit Size must be a multiple of CTUSize");
 
   vvenc_confirmParameter(c, c->m_alfSpeed < 0 || ( maxTLayer > 0 && c->m_alfSpeed > maxTLayer ),  "ALFSpeed out of range (0,log2(GopSize))" );
+  vvenc_confirmParameter(c, c->m_alfGpu < 0 || c->m_alfGpu > 3, "AlfGpu must be in range 0..3" );
   vvenc_confirmParameter(c, c->m_saoEncodingRate < 0.0       || c->m_saoEncodingRate > 1.0,       "SaoEncodingRate out of range [0.0 .. 1.0]");
   vvenc_confirmParameter(c, c->m_saoEncodingRateChroma < 0.0 || c->m_saoEncodingRateChroma > 1.0, "SaoEncodingRateChroma out of range [0.0 .. 1.0]");
   vvenc_confirmParameter(c, c->m_maxParallelFrames < 0,                                           "MaxParallelFrames out of range" );
